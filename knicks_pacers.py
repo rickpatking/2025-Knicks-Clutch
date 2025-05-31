@@ -9,6 +9,9 @@ from nba_api.stats.static import teams
 from nba_api.stats.endpoints import leaguegamefinder
 from nba_api.stats.endpoints import gamerotation
 import streamlit as st
+from sklearn.preprocessing import MultiLabelBinarizer
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 headers  = {
     'Connection': 'keep-alive',
@@ -47,7 +50,10 @@ def parse_iso_time(duration_str):
         return None
 
 clutch = pbp[pbp['period'] >= 4].copy()
-clutch['clock_secs'] = clutch['clock'].apply(parse_iso_time)
+clutch['clock_secs'] = (clutch['clock'].apply(parse_iso_time))
+clutch['real_time'] = None
+clutch.loc[clutch['period'] <= 4, 'real_time'] = ((clutch['period'] - 1) * 720 + (720 - clutch['clock_secs']))
+clutch.loc[clutch['period'] > 4, 'real_time'] = (2880 + 300 - clutch['clock_secs'])
 clutch['scoreHome'] = pd.to_numeric(clutch['scoreHome'], errors='coerce')
 clutch['scoreAway'] = pd.to_numeric(clutch['scoreAway'], errors='coerce')
 clutch['point_dif'] = clutch.scoreHome - clutch.scoreAway
@@ -63,6 +69,7 @@ clutch['TO'] = clutch['actionType'].str.contains('Turnover')
 clutch['REB'] = clutch['actionType'].str.contains('Rebound')
 clutch['FTA'] = clutch['actionType'].str.contains('Free Throw')
 clutch['FTM'] = clutch.apply(lambda row: False if 'MISS' in row['description'] and row['actionType']=='Free Throw'  else True if 'Free Throw' in row['description'] else False, axis=1)
+clutch['AST'] = clutch['description'].str.contains('AST')
 clutch['PTS'] = clutch.apply(lambda row: int(row['shotValue']) if 'Made' in row['shotResult'] else 1 if row['FTM'] else 0, axis=1)
 
 clutch_stats = clutch.groupby(['gameId', 'playerName']).agg({
@@ -84,17 +91,21 @@ clutch_stats = clutch_stats.iloc[1:]
 
 clutch_stats = clutch_stats.reset_index()
 
-# rotation = gamerotation.GameRotation(game_id='0042400305')
-# rotation = rotation.get_data_frames()[1]
-# rotation['IN_TIME_REAL'] = rotation['IN_TIME_REAL'].astype(int)/10
-# rotation['OUT_TIME_REAL'] = rotation['OUT_TIME_REAL'].astype(int)/10
-# rotation['playerName'] = rotation['PLAYER_FIRST'] + ' ' + rotation['PLAYER_LAST']
-# # print(rotation)
+rotations=[]
+for id in game_ids:
+    rotation = gamerotation.GameRotation(game_id=id)
+    rotation = rotation.get_data_frames()
+    for rot in rotation:
+        rot['IN_TIME_REAL'] = rot['IN_TIME_REAL'].astype(int)/10
+        rot['OUT_TIME_REAL'] = rot['OUT_TIME_REAL'].astype(int)/10
+        rot['playerName'] = rot['PLAYER_FIRST'] + ' ' + rot['PLAYER_LAST']
+        rotations.append(rot)
+rotations = pd.concat(rotations, ignore_index=True)
 
-def players_on_the_court(rotation, game_time_end, game_time_start=0):
+def players_on_the_court(rotation, game_time_start=0):
     return rotation[
         (rotation['IN_TIME_REAL'] <= game_time_start) &
-        (rotation['OUT_TIME_REAL'] >= game_time_end)][['playerName', 'TEAM_ID', 'IN_TIME_REAL', 'OUT_TIME_REAL']]
+        (rotation['OUT_TIME_REAL'] >= game_time_start)][['playerName', 'TEAM_ID', 'IN_TIME_REAL', 'OUT_TIME_REAL', 'GAME_ID']]
 
 def when_player_is_in(rotation, playerName):
     return rotation[rotation['playerName'] == playerName]
@@ -121,6 +132,7 @@ def stats_at_a_moment(pbp, game_time_end, game_time_start=0):
     clutch['FTA'] = clutch['actionType'].str.contains('Free Throw')
     clutch['FTM'] = clutch.apply(lambda row: False if 'MISS' in row['description'] and row[
         'actionType'] == 'Free Throw' else True if 'Free Throw' in row['description'] else False, axis=1)
+    clutch['AST'] = clutch['description'].str.contains('AST')
     clutch['PTS'] = clutch.apply(
         lambda row: int(row['shotValue']) if 'Made' in row['shotResult'] else 1 if row['FTM'] else 0, axis=1)
 
@@ -161,6 +173,43 @@ def stats_at_a_moment(pbp, game_time_end, game_time_start=0):
     clutch_stats = clutch_stats.reset_index()
     return [clutch_team_stats, clutch_stats]
 
+clutch['players_on_court'] = clutch['real_time'].apply(lambda t: players_on_the_court(rotations, t)['playerName'].tolist())
+
+records = []
+for _, row in clutch.iterrows():
+    if row['TO'] or row['AST']:
+        for player in row['players_on_court']:
+            records.append({
+                'playerName': player,
+                'event_type': 'TO' if row['TO'] else 'AST',
+                'game_time': row['real_time']
+            })
+
+clutch_start = clutch['real_time'].min()
+clutch_end = clutch['real_time'].max()
+def get_clutch_minutes(row):
+    in_time = max(row['IN_TIME_REAL'], clutch_start)
+    out_time = min(row['OUT_TIME_REAL'], clutch_end)
+    return max(0, out_time-in_time)/60
+rotations['clutch_minutes'] = rotations.apply(get_clutch_minutes, axis=1)
+clutch_minutes_df = rotations.groupby('playerName', as_index=False)['clutch_minutes'].sum()
+
+player_event_df = pd.DataFrame(records)
+player_impact = (player_event_df.groupby(['playerName', 'event_type']).size().unstack(fill_value=0).reset_index())
+rotations['clutch_minutes'] = rotations['clutch_minutes']
+player_minutes = rotations.groupby('playerName', as_index=False)['clutch_minutes'].sum()
+player_impact = player_impact.merge(player_minutes, on='playerName')
+player_impact['AST_per_min'] = player_impact['AST'] / player_impact['clutch_minutes']
+player_impact['TO_per_min'] = player_impact['TO'] / player_impact['clutch_minutes']
+player_impact['AST_per_5'] = player_impact['AST_per_min'] * 5
+player_impact['TO_per_5'] = player_impact['TO_per_min'] * 5
+player_team_map = rotations[['playerName', 'TEAM_NAME']].drop_duplicates()
+player_impact = player_impact.merge(player_team_map[['playerName', 'TEAM_NAME']], on='playerName', how='left')
+player_impact['AST_to_TO'] = player_impact['AST_per_5'] / player_impact['TO_per_5']
+player_impact['eligible'] = player_impact['clutch_minutes'].astype(int) > 2
+eligible_impact = player_impact[player_impact['eligible']]
+
+
 # st.title('Knicks vs Pacers ECF')
 #
 # stat_options = st.multiselect('Select stats to plot', options=clutch_stats.columns[1:], max_selections=2)
@@ -169,6 +218,18 @@ def stats_at_a_moment(pbp, game_time_end, game_time_start=0):
 # else:
 #     st.warning('Select at least something')
 
-start, end = st.select_slider('Select timing for rotations', options=np.linspace(0, 48, 49), value=[0,48])
-chart_data = stats_at_a_moment(pbp, end * 60, start * 60)[0]
-st.area_chart(chart_data, x='FG%', y='TO', color='teamTricode')
+# start, end = st.select_slider('Select timing for rotations', options=np.linspace(0, 48, 49), value=[0,48])
+# chart_data = stats_at_a_moment(pbp, end * 60, start * 60)[0]
+# st.bar_chart(chart_data, x='teamTricode', y='TO')
+
+# st.scatter_chart(player_impact, x='AST_per_36', y='TO_per_36', color='playerName')
+# st.bar_chart(player_impact, x='TEAM_NAME', y='AST_to_TO', color='playerName', stack=False)
+
+heatmap_data = eligible_impact.set_index('playerName')[['AST_per_5', 'TO_per_5']]
+plt.figure(figsize=(10,6))
+sns.heatmap(heatmap_data, annot=True, cmap='coolwarm', fmt='.2f')
+plt.title('AST and TO per 5 minutes per player')
+plt.xlabel('Metric')
+plt.ylabel('Player')
+plt.tight_layout()
+plt.show()
